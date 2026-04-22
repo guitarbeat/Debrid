@@ -28,7 +28,7 @@
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "parse-torrent": "^11.0.14",
-    "webtorrent": "2.1.32"
+    "webtorrent": "1.9.7"
   },
   "devDependencies": {
     "@types/compression": "^1.7.5",
