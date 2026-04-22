@@ -1,13 +1,45 @@
-import WebTorrent, { Torrent, TorrentFile as WTFile } from 'webtorrent';
+import type WebTorrent from 'webtorrent';
+import type { Torrent, TorrentFile as WTFile } from 'webtorrent';
 import { TorrentInfo, DebridProviderOptions, TorrentEngineStatus } from '../types';
 import { config } from '../config';
+
+type WebTorrentConstructor = new (options: {
+  maxConns?: number;
+  downloadLimit?: number;
+  uploadLimit?: number;
+}) => WebTorrent.Instance;
+
+const importWebTorrentModule = new Function(
+  'modulePath',
+  'return import(modulePath);'
+) as (modulePath: string) => Promise<unknown>;
+
+let webTorrentConstructorPromise: Promise<WebTorrentConstructor> | null = null;
+
+async function loadWebTorrentConstructor(): Promise<WebTorrentConstructor> {
+  if (!webTorrentConstructorPromise) {
+    webTorrentConstructorPromise = importWebTorrentModule('webtorrent')
+      .then((moduleExports: unknown) => {
+        const moduleWithDefault = moduleExports as { default?: unknown } | null;
+        const constructorCandidate = moduleWithDefault?.default ?? moduleExports;
+        if (typeof constructorCandidate !== 'function') {
+          throw new Error('Failed to resolve WebTorrent constructor');
+        }
+
+        return constructorCandidate as WebTorrentConstructor;
+      });
+  }
+
+  return webTorrentConstructorPromise;
+}
 
 /**
  * DebridProvider - Core torrent engine abstraction
  * Handles torrent downloading, streaming, and file management
  */
 export class DebridProvider {
-  private client: WebTorrent.Instance;
+  private client: WebTorrent.Instance | null;
+  private clientInitPromise: Promise<WebTorrent.Instance> | null;
   private activeTorrents: Map<string, Torrent>;
   private options: DebridProviderOptions;
 
@@ -18,12 +50,8 @@ export class DebridProvider {
       downloadPath: options.downloadPath || config.downloadPath,
     };
 
-    this.client = new WebTorrent({
-      maxConns: this.options.maxConnections,
-      downloadLimit: -1,
-      uploadLimit: -1,
-    });
-
+    this.client = null;
+    this.clientInitPromise = null;
     this.activeTorrents = new Map();
 
     // Cleanup handler
@@ -31,9 +59,33 @@ export class DebridProvider {
   }
 
   /**
+   * Lazily initialize WebTorrent to avoid boot-time crashes from runtime module format mismatches.
+   */
+  private async getClient(): Promise<WebTorrent.Instance> {
+    if (this.client) {
+      return this.client;
+    }
+
+    if (!this.clientInitPromise) {
+      this.clientInitPromise = loadWebTorrentConstructor().then((WebTorrentCtor) =>
+        new WebTorrentCtor({
+          maxConns: this.options.maxConnections,
+          downloadLimit: -1,
+          uploadLimit: -1,
+        })
+      );
+    }
+
+    this.client = await this.clientInitPromise;
+    return this.client;
+  }
+
+  /**
    * Add a torrent by magnet URI, info hash, or torrent file URL
    */
   async addTorrent(magnetOrInfoHash: string): Promise<TorrentInfo> {
+    const client = await this.getClient();
+
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         reject(new Error('Torrent metadata timeout'));
@@ -47,7 +99,7 @@ export class DebridProvider {
           magnetUri = `magnet:?xt=urn:btih:${magnetOrInfoHash}`;
         }
 
-        const torrent = this.client.add(magnetUri, {
+        const torrent = client.add(magnetUri, {
           path: this.options.downloadPath,
         });
 
@@ -88,8 +140,12 @@ export class DebridProvider {
    * Get torrent information by info hash
    */
   getTorrent(infoHash: string): Torrent | undefined {
-    return this.activeTorrents.get(infoHash) ||
-           this.client.torrents.find(t => t.infoHash === infoHash);
+    const activeTorrent = this.activeTorrents.get(infoHash);
+    if (activeTorrent || !this.client) {
+      return activeTorrent;
+    }
+
+    return this.client.torrents.find(t => t.infoHash === infoHash);
   }
 
   /**
@@ -277,8 +333,15 @@ export class DebridProvider {
    */
   async destroy(): Promise<void> {
     return new Promise((resolve) => {
+      if (!this.client) {
+        resolve();
+        return;
+      }
+
       this.client.destroy((err) => {
         if (err) console.error('Error destroying torrent client:', err);
+        this.client = null;
+        this.clientInitPromise = null;
         resolve();
       });
     });
